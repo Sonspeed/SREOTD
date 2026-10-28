@@ -43,6 +43,17 @@ def metric_max_over_ground_truths(metric_fn, prediction, ground_truths, xlingual
     return max(scores_for_ground_truths)
 
 
+def per_example_rouge(predictions, references):
+    """ROUGE-L F1 in ``[0, 1]`` for each prediction, maxed over multiple references."""
+    n = min(len(predictions), len(references))
+    scores = []
+    for pred, gold in zip(predictions[:n], references[:n]):
+        if not isinstance(gold, list):
+            gold = [gold]
+        scores.append(metric_max_over_ground_truths(rouge, pred, gold))
+    return scores
+
+
 def compute_metrics(predictions, references, xlingual=False):
     # assert len(predictions) == len(references), f"# of predictions {len(predictions)} doesn't match # of references {len(references)}."
     

@@ -15,6 +15,11 @@ from utils import save_rank
 from utils import get_tokenizer, get_model
 
 from evaluate_main import evaluate_main, prepare_dataset_main
+from distillm.multi_lora import (
+    inject_multi_lora,
+    load_sreotd_weights_if_present,
+    sync_sreotd_architecture_from_checkpoint,
+)
 
 
 torch.set_num_threads(4)
@@ -23,6 +28,10 @@ torch.set_num_threads(4)
 def setup_model(args, ds_config, device):
     # get the model
     model = get_model(args, device)
+    if getattr(args, "kd_objective", None) == "sr_eotd":
+        sync_sreotd_architecture_from_checkpoint(args)
+        inject_multi_lora(model, args)
+        load_sreotd_weights_if_present(model, args)
     # get the optimizer and lr_scheduler
 
     optimizer, lr_scheduler = None, None
@@ -50,7 +59,7 @@ def main():
     if dist.get_rank() == 0:
         print_args(args)
         with open(os.path.join(args.save, "args.json"), "w") as f:
-            json.dump(vars(args), f)
+            json.dump({key: value for key, value in vars(args).items() if key != "hf_token"}, f)
     
     device = torch.cuda.current_device()
     cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -81,8 +90,13 @@ def main():
         raise NotImplementedError
     model = setup_model(args, ds_config, device)
     
+    teacher_model = None
+    if getattr(args, "kd_objective", None) == "sr_eotd" and getattr(args, "teacher_model_path", None):
+        from finetune import get_teacher_model
+        teacher_model = get_teacher_model(args, device)
+
     if args.type == "eval_main":
-        evaluate_main(args, tokenizer, model, dataset["test"], "test", 0, device)
+        evaluate_main(args, tokenizer, model, dataset["test"], "test", 0, device, teacher_model=teacher_model)
     else:
         raise NotImplementedError
     

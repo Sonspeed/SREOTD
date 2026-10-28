@@ -39,8 +39,17 @@ from utils import get_tokenizer, get_model
 from distillm import forward_kl, reverse_kl, js_distance, tv_distance, ab_div, AKL, alphanet, bdkd
 from distillm import skewed_forward_kl, skewed_reverse_kl
 from distillm import SampleGenerator, ReplayBuffer
+from distillm import sr_eotd_loss, SREOTD_STAT_KEYS
+from distillm.multi_lora import (
+    inject_multi_lora,
+    load_sreotd_weights_if_present,
+    sync_sreotd_architecture_from_checkpoint,
+    unwrap_model,
+    get_lm_head_weight,
+    save_sreotd_checkpoint,
+)
 
-from rouge_metric import compute_metrics
+from rouge_metric import compute_metrics, per_example_rouge
 
 from peft import PeftModel
 
@@ -81,7 +90,8 @@ def get_optimizer(args, model):
     while isinstance(model, DDP):
         model = model.module
 
-    if args.peft is not None:
+    lora_only = getattr(args, "kd_objective", None) == "sr_eotd" and getattr(args, "sreotd_freeze_backbone", False)
+    if args.peft is not None or lora_only:
         param_groups = get_optimizer_params_peft(args, model)
     else:
         param_groups = get_optimizer_params(args, model)
@@ -110,6 +120,10 @@ def get_learning_rate_scheduler(args, optimizer):
 def setup_model_and_optimizer(args, ds_config, device, set_optim=True):
     # get the model
     model = get_model(args, device)
+    if getattr(args, "kd_objective", None) == "sr_eotd":
+        sync_sreotd_architecture_from_checkpoint(args)
+        inject_multi_lora(model, args)
+        load_sreotd_weights_if_present(model, args)
     # get the optimizer and lr_scheduler
     if set_optim:
         optimizer = get_optimizer(args, model)
@@ -143,13 +157,43 @@ def prepare_dataset(args, tokenizer):
     return data
 
 
+def sreotd_token_ce(args, model, model_batch, labels):
+    """Standard next-token CE on all M branches of a repeated batch."""
+    base = unwrap_model(model)
+    base.set_active_branch(None)
+    branches = args.num_lora_branches
+    bsz = model_batch["input_ids"].size(0)
+    repeated = {}
+    for key, value in model_batch.items():
+        if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == bsz:
+            repeated[key] = value.repeat_interleave(branches, dim=0)
+        else:
+            repeated[key] = value
+    rep_labels = labels.repeat_interleave(branches, dim=0)
+    outputs = model(**repeated, return_dict=True, use_cache=False)
+    logits = outputs.logits
+    return nn.CrossEntropyLoss(ignore_index=-100)(
+        logits.float().view(-1, logits.size(-1)),
+        rep_labels.view(-1),
+    )
+
+
 def pt_loss(args, model, model_batch, no_model_batch):
-    loss_mask = (no_model_batch["label"] != -100).int()
+    if getattr(args, "kd_objective", None) == "sr_eotd":
+        return sreotd_token_ce(args, model, model_batch, no_model_batch["label"])
     outputs = model(**model_batch, return_dict=True, use_cache=False)
     logits = outputs.logits
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
     lm_loss = loss_fn(logits.view(-1, logits.size(-1)), no_model_batch["label"].view(-1))
     return lm_loss
+
+
+def _reduce_stat_means(stats, device, world_size, group):
+    keys = list(SREOTD_STAT_KEYS)
+    values = torch.tensor([float(stats[key]) for key in keys], device=device, dtype=torch.float32)
+    dist.all_reduce(values, dist.ReduceOp.SUM, group=group)
+    values = values / world_size
+    return {key: float(values[i]) for i, key in enumerate(keys)}
 
 
 def symmetrize_and_selfloop(coo: torch.sparse_coo_tensor, self_val: float = 1.0):
@@ -324,6 +368,83 @@ def get_teacher_lm_loss(args, tokenizer, model, teacher_model, model_batch):
     return lm_loss
 
 
+def _latest_sreotd_ckpt(save_dir):
+    best = os.path.join(save_dir, "best_ckpt")
+    if os.path.isfile(os.path.join(best, "sreotd_model.pt")):
+        return best
+    if not os.path.isdir(save_dir):
+        return None
+    steps = []
+    for name in os.listdir(save_dir):
+        if name.isdigit() and os.path.isfile(os.path.join(save_dir, name, "sreotd_model.pt")):
+            steps.append(int(name))
+    if not steps:
+        return None
+    return os.path.join(save_dir, str(max(steps)))
+
+
+def _load_hf_hub():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "hf_hub_manager.py")
+    spec = importlib.util.spec_from_file_location("sreotd_hf_hub_manager", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _consider_sreotd_best(args, model, tokenizer):
+    """Keep the dev checkpoint with the highest Best-of-M ROUGE-L (or lowest loss)."""
+    if getattr(args, "kd_objective", None) != "sr_eotd":
+        return
+    score = getattr(args, "sreotd_last_val_score", None)
+    if score is None or score != score:
+        return
+    previous = getattr(args, "sreotd_best_val_score", None)
+    improved = previous is None or score > previous
+    if not improved:
+        return
+    args.sreotd_best_val_score = score
+    if dist.get_rank() == 0:
+        best_dir = os.path.join(args.save, "best_ckpt")
+        save_sreotd_checkpoint(model, tokenizer, best_dir, args)
+        metrics = getattr(args, "sreotd_last_val_metrics", None)
+        if metrics:
+            with open(os.path.join(best_dir, "val_metrics.json"), "w") as handle:
+                json.dump(metrics, handle, indent=2)
+        print_rank(f"New SR-EOTD best checkpoint ({score:.4f}) -> {best_dir}")
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def _push_sreotd_model_if_requested(args):
+    if getattr(args, "kd_objective", None) != "sr_eotd" or not getattr(args, "push_to_hf", False):
+        return
+    if dist.is_initialized() and dist.get_rank() != 0:
+        dist.barrier()
+        return
+    repo = getattr(args, "hf_model_repo_id", None)
+    if not repo:
+        raise ValueError("--push-to-hf during training requires --hf-model-repo-id")
+    ckpt_dir = _latest_sreotd_ckpt(args.save)
+    if ckpt_dir is None:
+        raise FileNotFoundError(f"No SR-EOTD checkpoint under {args.save}")
+    metrics = None
+    metrics_path = os.path.join(ckpt_dir, "val_metrics.json")
+    if os.path.isfile(metrics_path):
+        with open(metrics_path) as handle:
+            metrics = json.load(handle)
+    _load_hf_hub().push_sreotd_model_to_hub(
+        ckpt_dir,
+        repo,
+        token=getattr(args, "hf_token", None),
+        private=bool(getattr(args, "hf_private", False)),
+        export_merged_branches=bool(getattr(args, "hf_export_merged_branches", False)),
+        metrics=metrics,
+    )
+    if dist.is_initialized():
+        dist.barrier()
+
+
 def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, optimizer: AdamW, lr_scheduler, dataset, device, teacher_model=None):
     print_rank("Start Fine-tuning")
 
@@ -348,15 +469,18 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
     step, global_step = 1, 1
     total_loss, total_distil_loss, total_time = 0.0, 0.0, 0.0
+    sreotd_window = {key: 0.0 for key in SREOTD_STAT_KEYS}
+    sreotd_window_steps = 0
 
     adaptive_threshold = args.init_threshold if "adaptive" in args.type else None
     # prev_avg_loss, _ = evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device, adaptive_threshold)
     prev_avg_loss = evaluate(args, tokenizer, model, dataset["dev"], "dev", 0, device, adaptive_threshold)
+    _consider_sreotd_best(args, model, tokenizer)
     replay_buffer = ReplayBuffer(args)
 
     total_res = []
 
-    if args.amid_div_name in ['wass', 'sink']:
+    if args.amid_div_name in ['wass', 'sink'] and getattr(args, "kd_objective", None) != "sr_eotd":
         mat_K, mat_Kt = get_sparse_cost_kernel(args, model, teacher_model, device)
     else:
         mat_K, mat_Kt = None, None
@@ -394,6 +518,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                         samp_threshold = adaptive_threshold * (1 - global_step / args.total_iters)
 
                 # data generation
+                if args.student_gen and getattr(args, "kd_objective", None) == "sr_eotd":
+                    unwrap_model(model).set_active_branch(0)
                 if args.student_gen:
                     r = np.random.uniform(0, 1)
                     if "mixed" in args.type and r < args.mixed_alpha:
@@ -420,19 +546,42 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
                     model.train()
 
-            outputs = model(**model_batch, use_cache=False)
-
-            logits = outputs.logits
-            if args.model_parallel:
-                raise NotImplementedError
+            sreotd_stats = None
+            if getattr(args, "kd_objective", None) == "sr_eotd":
+                if teacher_model is None:
+                    raise ValueError("SR-EOTD requires --teacher-model-path.")
+                with torch.no_grad():
+                    teacher_logits = teacher_model(**model_batch, use_cache=False).logits
+                student = unwrap_model(model)
+                student_hidden_states = student.forward_multi_branch(**model_batch)
+                distil_loss, sreotd_stats = sr_eotd_loss(
+                    args,
+                    teacher_logits,
+                    student_hidden_states,
+                    get_lm_head_weight(student),
+                    no_model_batch,
+                )
+                if args.kd_ratio < 1.0:
+                    lm_loss = sreotd_token_ce(args, model, model_batch, no_model_batch["label"])
+                    loss = (1 - args.kd_ratio) * lm_loss + args.kd_ratio * distil_loss
+                else:
+                    loss = distil_loss
+                # all_reduce below is in-place; keep a distinct tensor for the KD term.
+                distil_loss = distil_loss.detach().clone()
             else:
-                lm_loss = loss_func(logits.float().view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
+                outputs = model(**model_batch, use_cache=False)
 
-            if teacher_model is not None:
-                distil_loss = get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model_batch, logits, epoch, mat_K=mat_K, mat_Kt=mat_Kt)
-                loss = (1 - args.kd_ratio) * lm_loss + args.kd_ratio * distil_loss
-            else:
-                loss = lm_loss
+                logits = outputs.logits
+                if args.model_parallel:
+                    raise NotImplementedError
+                else:
+                    lm_loss = loss_func(logits.float().view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
+
+                if teacher_model is not None:
+                    distil_loss = get_distil_loss(args, tokenizer, model, teacher_model, model_batch, no_model_batch, logits, epoch, mat_K=mat_K, mat_Kt=mat_Kt)
+                    loss = (1 - args.kd_ratio) * lm_loss + args.kd_ratio * distil_loss
+                else:
+                    loss = lm_loss
 
             if args.lm_data_dir is not None:
                 assert args.lm_coef is not None
@@ -449,6 +598,11 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                 dist.all_reduce(distil_loss, dist.ReduceOp.SUM, group=dp_group)
                 global_distil_loss = distil_loss.item() / dp_world_size
                 total_distil_loss += global_distil_loss
+            if sreotd_stats is not None:
+                reduced_stats = _reduce_stat_means(sreotd_stats, loss.device, dp_world_size, dp_group)
+                for key, value in reduced_stats.items():
+                    sreotd_window[key] += value
+                sreotd_window_steps += 1
 
             torch.cuda.synchronize()
             elapsed_time = time.time() - st_time
@@ -480,6 +634,14 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
             if global_step % args.log_interval == 0 and step % args.gradient_accumulation_steps == 0:
                 log_str = get_log(total_loss / (args.log_interval * args.gradient_accumulation_steps), total_distil_loss / (args.log_interval * args.gradient_accumulation_steps), total_time / (args.log_interval))
+                if sreotd_window_steps > 0:
+                    stat_str = " | ".join(
+                        f"{key}: {sreotd_window[key] / sreotd_window_steps:.4f}" for key in SREOTD_STAT_KEYS
+                    )
+                    log_str = log_str + " | " + stat_str
+                    for key in sreotd_window:
+                        sreotd_window[key] = 0.0
+                    sreotd_window_steps = 0
                 print_rank("*" * 100)
                 print_rank(log_str)
                 print_rank(args.save)
@@ -496,14 +658,18 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
                     if dist.get_rank() == 0:
                         os.makedirs(save_dir_path, exist_ok=True)
                         print_rank(f"Model save to {save_dir_path}")
-                        tokenizer.save_pretrained(save_dir_path)
-                        model.module.save_pretrained(save_dir_path, safe_serialization=False)
+                        if getattr(args, "kd_objective", None) == "sr_eotd":
+                            save_sreotd_checkpoint(model, tokenizer, save_dir_path, args)
+                        else:
+                            tokenizer.save_pretrained(save_dir_path)
+                            model.module.save_pretrained(save_dir_path, safe_serialization=False)
                 dist.barrier()
 
             # Evaluation
             if args.eval_interval and global_step % args.eval_interval == 0 and step % args.gradient_accumulation_steps == 0:
                 # curr_avg_loss, cur_res = evaluate(args, tokenizer, model, dataset["dev"], "dev", epoch, device, adaptive_threshold)
                 curr_avg_loss = evaluate(args, tokenizer, model, dataset["dev"], "dev", epoch, device, adaptive_threshold)
+                _consider_sreotd_best(args, model, tokenizer)
                 if "adaptive" in args.type:
                     if curr_avg_loss >= prev_avg_loss + args.loss_eps:
                         adaptive_threshold += 0.1
@@ -519,6 +685,8 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
             if global_step > args.total_iters:
                 break
 
+    _push_sreotd_model_if_requested(args)
+
     ##### Save #####
     # total_res = np.array(total_res)
     # best_res = total_res[np.argmax(total_res[:, -1])]
@@ -528,7 +696,130 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
     return model
 
 
+def _decode_generated(tokenizer, response_ids):
+    return tokenizer.batch_decode(response_ids.cpu(), skip_special_tokens=True)
+
+
+def _gather_padded_ids(chunks, world_size, group):
+    ids = torch.cat(chunks, dim=0)
+    ids = all_gather(ids, dim=1, world_size=world_size, group=group, op="stack")
+    return ids.view(-1, ids.size(-1))
+
+
+def evaluate_sreotd(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, device, adaptive_threshold=None):
+    """Validation CE plus ROUGE-L of every LoRA branch, the mean, and the oracle best."""
+    collate_fn = dataset.collate
+    dp_world_size = dist.get_world_size()
+    dp_rank = dist.get_rank()
+    dp_group = None
+    loss_func = nn.CrossEntropyLoss()
+    student = unwrap_model(model)
+    branches = args.num_lora_branches
+
+    generation_config = GenerationConfig(
+        do_sample=args.do_sample,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        min_length=None,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.eos_token_id,
+        return_dict_in_generate=True,
+        output_scores=False
+    )
+    sampler = DistributedSampler(dataset, shuffle=False, drop_last=False, rank=dp_rank, num_replicas=dp_world_size)
+    dataloader = DataLoader(dataset, sampler=sampler, batch_size=args.eval_batch_size, num_workers=args.num_workers, collate_fn=collate_fn)
+
+    model.eval()
+    all_loss = 0.0
+    step = 0
+    branch_response_chunks = [[] for _ in range(branches)]
+
+    with torch.no_grad():
+        for model_batch, no_model_batch, gen_data in tqdm(dataloader, desc="Evaluating SR-EOTD", disable=(dist.get_rank() != 0)):
+            dataset.move_to_device(model_batch, no_model_batch, gen_data, device)
+            loss_sum = None
+            max_new_tokens = args.max_length - gen_data["input_ids"].size(1)
+            for branch in range(branches):
+                student.set_active_branch(branch)
+                logits = model(**model_batch).logits
+                branch_loss = loss_func(logits.view(-1, logits.shape[-1]), no_model_batch["label"].view(-1))
+                loss_sum = branch_loss if loss_sum is None else loss_sum + branch_loss
+                if args.eval_gen:
+                    gen_out = model.generate(**gen_data, generation_config=generation_config, max_new_tokens=max_new_tokens)
+                    full_ids = F.pad(gen_out.sequences, (0, args.max_length - gen_out.sequences.shape[1]), value=tokenizer.pad_token_id)
+                    response_ids = full_ids[:, gen_data["input_ids"].size(1):]
+                    branch_response_chunks[branch].append(response_ids)
+            loss = loss_sum / branches
+            dist.all_reduce(loss, dist.ReduceOp.SUM, group=dp_group)
+            all_loss += (loss / dp_world_size).item()
+            step += 1
+
+    student.set_active_branch(None)
+    branch_texts = []
+    if args.eval_gen:
+        for branch in range(branches):
+            response_ids = _gather_padded_ids(branch_response_chunks[branch], dp_world_size, dp_group)
+            branch_texts.append(_decode_generated(tokenizer, response_ids))
+
+    avg_loss = all_loss / max(step, 1)
+    selection = -float(avg_loss)
+    if get_rank() == 0 and args.eval_gen:
+        references = dataset.answers
+        per_branch_scores = []
+        rouge_values = []
+        log_parts = [f"{split} | avg_loss: {avg_loss}"]
+        prefix = "val" if split in {"dev", "valid", "val"} else split
+        for branch, texts in enumerate(branch_texts):
+            texts = texts[:len(references)]
+            scores = per_example_rouge(texts, references)
+            rouge_l = 100.0 * (sum(scores) / len(scores) if scores else 0.0)
+            per_branch_scores.append(scores)
+            rouge_values.append(rouge_l)
+            log_parts.append(f"{prefix}_rougeL_branch_{branch}: {rouge_l:.4f}")
+            eval_dir = os.path.join(args.save, "eval", str(epoch), f"branch_{branch}")
+            os.makedirs(eval_dir, exist_ok=True)
+            with open(os.path.join(eval_dir, "answers.jsonl"), "w") as handle:
+                for text in texts:
+                    handle.write(json.dumps({"text": text}) + "\n")
+        width = min((len(scores) for scores in per_branch_scores), default=0)
+        best = None
+        mean_score = None
+        if width > 0:
+            best = 100.0 * sum(max(per_branch_scores[b][i] for b in range(branches)) for i in range(width)) / width
+            mean_score = sum(rouge_values) / len(rouge_values)
+            log_parts.append(f"{prefix}_rougeL_mean: {mean_score:.4f}")
+            log_parts.append(f"{prefix}_rougeL_best: {best:.4f}")
+            selection = float(best)
+        log_str = " | ".join(log_parts)
+        print_rank(log_str)
+        save_rank(log_str, os.path.join(args.save, "log.txt"))
+        args.sreotd_last_val_metrics = {
+            "split": split,
+            "avg_loss": avg_loss,
+            "rougeL_mean": None if mean_score is None else round(mean_score, 4),
+            "rougeL_best": None if best is None else round(best, 4),
+        }
+        for branch, value in enumerate(rouge_values):
+            args.sreotd_last_val_metrics[f"rougeL_branch_{branch}"] = round(value, 4)
+    elif get_rank() == 0:
+        log_str = f"{split} | avg_loss: {avg_loss}"
+        print_rank(log_str)
+        save_rank(log_str, os.path.join(args.save, "log.txt"))
+        args.sreotd_last_val_metrics = {"split": split, "avg_loss": avg_loss}
+
+    if dist.is_initialized():
+        packed = torch.tensor([selection if get_rank() == 0 else 0.0], dtype=torch.float64, device=device)
+        dist.broadcast(packed, src=0)
+        selection = float(packed.item())
+    args.sreotd_last_val_score = selection
+    return avg_loss
+
+
 def evaluate(args, tokenizer, model, dataset: LMTrainDataset, split, epoch, device, adaptive_threshold=None):
+    if getattr(args, "kd_objective", None) == "sr_eotd":
+        return evaluate_sreotd(args, tokenizer, model, dataset, split, epoch, device, adaptive_threshold)
     collate_fn = dataset.collate
 
     if args.model_parallel:
@@ -633,7 +924,7 @@ def main():
     if dist.get_rank() == 0:
         print_args(args)
         with open(os.path.join(args.save, "args.json"), "w") as f:
-            json.dump(vars(args), f)
+            json.dump({key: value for key, value in vars(args).items() if key != "hf_token"}, f)
 
     device = torch.cuda.current_device()
     cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())

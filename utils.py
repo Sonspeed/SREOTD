@@ -31,7 +31,10 @@ def print_args(args):
     print('arguments:', flush=True)
     for arg in vars(args):
         dots = '.' * (29 - len(arg))
-        print('  {} {} {}'.format(arg, dots, getattr(args, arg)), flush=True)
+        value = getattr(args, arg)
+        if arg == "hf_token" and value:
+            value = "***"
+        print('  {} {} {}'.format(arg, dots, value), flush=True)
 
 
 def save_rank(log_str, save_path, rank=0):
@@ -130,13 +133,19 @@ def get_model(args, device):
     else:
         config.is_model_parallel = False
         dtype = torch.float32 if args.fp32 else torch.float16
-        try:
-            model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=dtype)
-        except:
-            model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=torch.float32)
-            model = model.half()
+        from distillm.multi_lora import sreotd_state_only_checkpoint
+        if sreotd_state_only_checkpoint(args):
+            # Saved SR-EOTD dirs store sreotd_model.pt plus config, not a HF bin.
+            model = AutoModelForCausalLM.from_config(config)
+            model = model.to(device=device, dtype=dtype)
+        else:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=dtype)
+            except:
+                model = AutoModelForCausalLM.from_pretrained(args.model_path, config=config, device_map={"": device}, torch_dtype=torch.float32)
+                model = model.half()
         
-        if args.peft is not None:
+        if args.peft is not None and getattr(args, "kd_objective", None) != "sr_eotd":
             if args.peft == "lora":
                 model.enable_input_require_grads()
                 if args.peft_path is not None:

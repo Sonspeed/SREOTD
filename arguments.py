@@ -174,8 +174,79 @@ def add_minillm_args(parser: argparse.ArgumentParser):
     return parser
 
 
+def _str2bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean, got {value!r}")
+
+
+def _infer_sreotd_freeze_backbone(args):
+    """GPT-2 keeps the shared backbone trainable. PEFT-style families freeze it."""
+    model_type = (getattr(args, "model_type", None) or "").lower()
+    if model_type in {"gpt2", "gptj", "opt"}:
+        return False
+    if any(key in model_type for key in ("llama", "qwen", "mistral")):
+        return True
+    blob = " ".join([
+        getattr(args, "ckpt_name", None) or "",
+        getattr(args, "model_path", None) or "",
+    ]).lower()
+    return any(key in blob for key in ("llama", "qwen", "mistral"))
+
+
 def add_distillm_args(parser: argparse.ArgumentParser):
     group = parser.add_argument_group('distillm', 'distillm configurations')
+
+    # SR-EOTD: router-free multi-LoRA distillation. Active when --kd-objective sr_eotd.
+    group.add_argument("--kd-objective", type=str, default=None,
+                       help="Set to 'sr_eotd' to train with Semi-Relaxed Entropic OT Decomposition.")
+    group.add_argument("--num-lora-branches", type=int, default=3,
+                       help="Number of LoRA branches M.")
+    group.add_argument("--sreotd-lora-r", type=int, default=16,
+                       help="LoRA rank r of each branch.")
+    group.add_argument("--sreotd-lora-alpha", type=int, default=16,
+                       help="LoRA alpha. The branch scale is alpha / r.")
+    group.add_argument("--sreotd-topk", type=int, default=64,
+                       help="Teacher top-K support used by the transport plan.")
+    group.add_argument("--sreotd-sinkhorn-iters", type=int, default=5,
+                       help="Damped log-Sinkhorn iterations L.")
+    group.add_argument("--sreotd-eps-min", type=float, default=0.05,
+                       help="Lower end of the adaptive entropic temperature.")
+    group.add_argument("--sreotd-eps-max", type=float, default=1.0,
+                       help="Upper end of the adaptive entropic temperature.")
+    group.add_argument("--sreotd-gamma", type=float, default=3.0,
+                       help="Decay of the adaptive temperature with teacher entropy.")
+    group.add_argument("--sreotd-rho", type=float, default=0.5,
+                       help="Soft row-marginal penalty rho.")
+    group.add_argument("--sreotd-beta", type=float, default=0.5,
+                       help="Weight of the entropy-modulated reverse KL.")
+    group.add_argument("--sreotd-sigma-b", type=float, default=1e-3,
+                       help="Stddev of the Gaussian init of LoRA B.")
+    group.add_argument("--sreotd-tau", type=float, default=1.0,
+                       help="Temperature of the teacher distribution on the top-K logits.")
+    group.add_argument("--sreotd-freeze-backbone", type=_str2bool, default=None, nargs="?", const=True,
+                       help="Freeze shared backbone phi and train only the LoRA branches. "
+                            "Default is False for GPT-2 and True for LLaMA/OpenLLaMA/Qwen/Mistral. "
+                            "Pass the flag alone to force True, or 'false' to force False.")
+    group.add_argument("--sreotd-diag-samples", type=int, default=256,
+                       help="Leading eval examples stored with token-level logits and OT plans.")
+    group.add_argument("--push-to-hf", action="store_true",
+                       help="Upload the SR-EOTD checkpoint and eval artifacts to the Hugging Face Hub.")
+    group.add_argument("--hf-model-repo-id", type=str, default=None,
+                       help="Model Hub repo id, for example sonspeed/sreotd-gpt2-base-m3.")
+    group.add_argument("--hf-dataset-repo-id", type=str, default=None,
+                       help="Dataset Hub repo id. Defaults to '{hf-model-repo-id}-eval-data' when --push-to-hf is set.")
+    group.add_argument("--hf-token", type=str, default=None,
+                       help="Hugging Face token. Falls back to the HF_TOKEN environment variable.")
+    group.add_argument("--hf-private", action="store_true",
+                       help="Create the model repo and the dataset repo as private.")
+    group.add_argument("--hf-export-merged-branches", action="store_true",
+                       help="Also upload M standalone models with one LoRA branch merged into the backbone.")
 
     # skew kld
     group.add_argument("--skew-alpha", type=float, default=0.1)
@@ -375,5 +446,22 @@ def get_args():
 
         if args.warmup_iters > 0:
             assert args.scheduler_name is not None
+
+    if args.kd_objective is not None and args.kd_objective != "sr_eotd":
+        raise ValueError(f"Unknown --kd-objective {args.kd_objective!r}. Supported value: sr_eotd")
+    if args.sreotd_freeze_backbone is None:
+        args.sreotd_freeze_backbone = _infer_sreotd_freeze_backbone(args)
+    if args.num_lora_branches < 1:
+        raise ValueError("--num-lora-branches must be positive")
+    if args.sreotd_lora_r < 1:
+        raise ValueError("--sreotd-lora-r must be positive")
+    if args.sreotd_topk < 1:
+        raise ValueError("--sreotd-topk must be positive")
+    if args.sreotd_diag_samples < 1:
+        raise ValueError("--sreotd-diag-samples must be positive")
+    if args.hf_token is None:
+        args.hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if args.push_to_hf and args.hf_dataset_repo_id is None and args.hf_model_repo_id:
+        args.hf_dataset_repo_id = f"{args.hf_model_repo_id}-eval-data"
 
     return args

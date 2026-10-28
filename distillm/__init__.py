@@ -4,3 +4,4 @@ from .sampler import SampleGenerator
 from .buffer import ReplayBuffer
 
 from .losses import amid
+from .losses import sr_eotd_loss, compute_sr_eotd, SREOTD_STAT_KEYS
