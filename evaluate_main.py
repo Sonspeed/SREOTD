@@ -236,8 +236,10 @@ def _cross_branch_distinct2(branch_texts):
 def _jsd_and_disagreement(hidden, weight, bias, mask):
     """Token JSD of the M branch distributions and the count of top-1 disagreements."""
     batch, _, branches, _ = hidden.shape
-    jsd_sum = hidden.new_zeros(batch)
-    disagree_sum = hidden.new_zeros(batch)
+    # Accumulate in fp32. Branch hidden states are fp16/bf16, while the
+    # full-vocab JSD below is computed in fp32.
+    jsd_sum = torch.zeros(batch, device=hidden.device, dtype=torch.float32)
+    disagree_sum = torch.zeros(batch, device=hidden.device, dtype=torch.float32)
     positions = mask.nonzero(as_tuple=False)
     if positions.numel() == 0:
         return jsd_sum, disagree_sum

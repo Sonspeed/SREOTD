@@ -489,7 +489,14 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
         sampler.set_epoch(epoch)
 
         model.train()
-        for it, (model_batch, no_model_batch, gen_data) in enumerate(train_dataloader):
+        train_bar = tqdm(
+            train_dataloader,
+            desc=f"Train epoch {epoch + 1}/{args.epochs}",
+            disable=(get_rank() != 0),
+            dynamic_ncols=True,
+            leave=True,
+        )
+        for it, (model_batch, no_model_batch, gen_data) in enumerate(train_bar):
             dataset["train"].move_to_device(model_batch, no_model_batch, gen_data, device)
 
             if args.lm_data_dir is not None:
@@ -609,6 +616,14 @@ def finetune(args, tokenizer: AutoTokenizer, model: deepspeed.DeepSpeedEngine, o
 
             total_loss += global_loss
             total_time += elapsed_time
+
+            if get_rank() == 0:
+                train_bar.set_postfix(
+                    loss=f"{global_loss:.4f}",
+                    ds_loss=f"{global_distil_loss:.4f}",
+                    lr=f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                    refresh=False,
+                )
 
             # Logging
             def get_log(log_loss, log_distil_loss, log_time):

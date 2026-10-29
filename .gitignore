@@ -3,3 +3,9 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Downloaded weights, datasets, and run outputs
+checkpoints/
+results/
+data/
+processed_data/
