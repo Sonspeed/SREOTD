@@ -27,9 +27,17 @@ TEACHER_CKPT="${BASE_PATH}/results/gpt2/train/sft/gpt2-xlarge/"
 DATA_DIR="${BASE_PATH}/processed_data/dolly/full/gpt2/"
 LM_DATA_DIR="${BASE_PATH}/processed_data/openwebtext/gpt2/512/10M/"
 # hp
-BATCH_SIZE=${4-32}
+EFFECTIVE_BATCH_SIZE=32
+BATCH_SIZE=${4:-2}  # micro batch size trên mỗi GPU
+GLOBAL_BATCH_SIZE=$((BATCH_SIZE * GPUS_PER_NODE))
+
+if (( EFFECTIVE_BATCH_SIZE % GLOBAL_BATCH_SIZE != 0 )); then
+    echo "Error: EFFECTIVE_BATCH_SIZE phải chia hết cho GLOBAL_BATCH_SIZE"
+    exit 1
+fi
+GRAD_ACC=$((EFFECTIVE_BATCH_SIZE / GLOBAL_BATCH_SIZE))
+
 LR=${5-0.0001}
-GRAD_ACC=1
 EVAL_BATCH_SIZE=64
 # length
 MAX_LENGTH=512
@@ -72,7 +80,7 @@ OPTS+=" --max-prompt-length 256"
 # runtime
 OPTS+=" --do-train"
 OPTS+=" --do-valid"
-OPTS+=" --eval-gen"
+# OPTS+=" --eval-gen"
 OPTS+=" --save-interval -1"
 OPTS+=" --eval-interval -1"
 OPTS+=" --log-interval 4"
